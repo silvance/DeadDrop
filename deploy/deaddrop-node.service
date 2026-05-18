@@ -1,0 +1,35 @@
+[Unit]
+Description=DeadDrop Reticulum/LoRA dead-drop message store
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Run as a dedicated unprivileged user. Create with:
+#   sudo useradd --system --create-home --home /var/lib/deaddrop --shell /usr/sbin/nologin deaddrop
+User=deaddrop
+Group=deaddrop
+Environment=DEADDROP_HOME=/var/lib/deaddrop
+Environment=RETICULUM_CONFIGDIR=/var/lib/deaddrop/reticulum
+ExecStart=/usr/local/bin/deaddrop-node run -v
+Restart=on-failure
+RestartSec=5s
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/deaddrop
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+# Comment the next line out if you're running over a serial RNode (LoRA).
+PrivateDevices=true
+
+[Install]
+WantedBy=multi-user.target
