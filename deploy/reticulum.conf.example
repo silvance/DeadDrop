@@ -1,0 +1,49 @@
+# Example Reticulum configuration for a DeadDrop node.
+#
+# Drop one of the [[interfaces.*]] blocks below depending on your transport.
+# Save as $RETICULUM_CONFIGDIR/config (default: ~/.reticulum/config).
+
+[reticulum]
+  enable_transport = Yes
+  share_instance = Yes
+  shared_instance_port = 37428
+  instance_control_port = 37429
+  panic_on_interface_error = No
+
+[logging]
+  loglevel = 4
+
+[interfaces]
+
+  # ---------------------------------------------------------------
+  # Lab / testing transport: plain TCP. Two processes on one host or
+  # two hosts on a LAN can talk over this.
+  # ---------------------------------------------------------------
+  [[Default TCP Interface]]
+    type = TCPServerInterface
+    enabled = Yes
+    listen_ip = 0.0.0.0
+    listen_port = 4242
+
+  # Uncomment on the client side to dial a node:
+  # [[Peer Node]]
+  #   type = TCPClientInterface
+  #   enabled = Yes
+  #   target_host = node.example.org
+  #   target_port = 4242
+
+  # ---------------------------------------------------------------
+  # Production transport: RNode-compatible LoRa radio over serial.
+  # Replace `port`, `frequency`, etc. for your hardware and region.
+  # ---------------------------------------------------------------
+  # [[LoRa RNode]]
+  #   type = RNodeInterface
+  #   enabled = Yes
+  #   port = /dev/ttyUSB0
+  #   frequency = 867200000        ; Hz (EU868 example)
+  #   bandwidth = 125000           ; Hz
+  #   txpower = 17                 ; dBm
+  #   spreadingfactor = 8
+  #   codingrate = 5
+  #   id_callsign = N0CALL-DEADDROP
+  #   id_interval = 600            ; seconds
