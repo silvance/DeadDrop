@@ -192,3 +192,32 @@ def test_node_fills_up(node: DeadDropNode) -> None:
         0,
     ))
     assert resp["status"] == protocol.ERR_FULL
+
+
+def test_handle_put_accepts_anonymous_sender(node: DeadDropNode) -> None:
+    """Clients do not identify on put links, so remote_identity is None."""
+    payload = protocol.encode({
+        "recipient_hash": b"R" * 16,
+        "ciphertext": b"opaque",
+        "ttl_seconds": 60,
+    })
+    resp = protocol.decode(node._handle_put("put", payload, 1, None, 0))
+    assert resp["status"] == protocol.OK
+
+
+def test_node_does_not_store_sender_identity(node: DeadDropNode) -> None:
+    import sqlite3
+
+    sender = _identity_stub(b"\x5e" * 16)
+    node._handle_put(
+        "put",
+        protocol.encode({"recipient_hash": b"R" * 16, "ciphertext": b"opaque", "ttl_seconds": 60}),
+        1,
+        sender,
+        0,
+    )
+    conn = sqlite3.connect(node.config.db_path)
+    rows = conn.execute("SELECT * FROM drops").fetchall()
+    conn.close()
+    assert rows
+    assert all(sender.hash not in (v if isinstance(v, bytes) else b"") for row in rows for v in row)
