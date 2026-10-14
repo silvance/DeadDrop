@@ -81,3 +81,76 @@ def test_envelope_recipient_mismatch_detected() -> None:
     ciphertext = target.encrypt(bogus)
     with pytest.raises(ValueError, match="recipient"):
         decrypt_with(target, ciphertext)
+
+
+# ---- padding (envelope v2) --------------------------------------------------
+
+from deaddrop.crypto import (  # noqa: E402
+    CIPHER_OVERHEAD,
+    CIPHERTEXT_BUCKETS,
+    PayloadTooLarge,
+    max_body_bytes,
+)
+
+
+@pytest.mark.parametrize("body_len", [0, 1, 100, 1000, 5000, 20000, 60000])
+def test_ciphertext_length_is_always_a_bucket(body_len: int) -> None:
+    recipient = RNS.Identity()
+    ciphertext = encrypt_for(recipient, b"\xaa" * body_len, sender_hash=b"S" * 16)
+    assert len(ciphertext) in CIPHERTEXT_BUCKETS
+    assert decrypt_with(recipient, ciphertext).body == b"\xaa" * body_len
+
+
+def test_bucket_boundary() -> None:
+    """A body that exactly fills a bucket stays in it; one more byte moves up."""
+    recipient = RNS.Identity()
+    mime = "text/plain"
+    header_and_mime = 40 + len(mime)  # v2 header is 40 bytes
+    fits =CIPHERTEXT_BUCKETS[0] - CIPHER_OVERHEAD - header_and_mime
+    assert len(encrypt_for(recipient, b"x" * fits, mime=mime)) == CIPHERTEXT_BUCKETS[0]
+    assert len(encrypt_for(recipient, b"x" * (fits + 1), mime=mime)) == CIPHERTEXT_BUCKETS[1]
+
+
+def test_largest_body_fits_and_one_more_byte_does_not() -> None:
+    recipient = RNS.Identity()
+    limit = max_body_bytes()
+    ciphertext = encrypt_for(recipient, b"x" * limit)
+    assert len(ciphertext) == CIPHERTEXT_BUCKETS[-1]
+    with pytest.raises(PayloadTooLarge):
+        encrypt_for(recipient, b"x" * (limit + 1))
+
+
+def test_padding_keeps_trailing_zero_bytes_in_body() -> None:
+    body = b"data\x00\x00\x00"
+    env = unpack_envelope(pack_envelope(b"R" * 16, body))
+    assert env.body == body
+
+
+def test_unpack_rejects_body_length_past_end() -> None:
+    packed = bytearray(pack_envelope(b"R" * 16, b"hello", mime=""))
+    # body_len lives at bytes 36..40 of the v2 header.
+    packed[36:40] = (len(packed) + 1).to_bytes(4, "big")
+    with pytest.raises(ValueError, match="truncated"):
+        unpack_envelope(bytes(packed))
+
+
+def test_version_1_envelope_still_decodes() -> None:
+    """Drops written by deaddrop 0.1.0 (unpadded v1) remain readable."""
+    import struct
+
+    recipient = RNS.Identity()
+    mime = b"text/plain"
+    v1 = (
+        struct.pack("!BB16s16sH", 1, 1, recipient.hash, b"S" * 16, len(mime))
+        + mime
+        + b"old drop"
+    )
+    env = decrypt_with(recipient, recipient.encrypt(v1))
+    assert env.body == b"old drop"
+    assert env.sender_hash == b"S" * 16
+    assert env.mime == "text/plain"
+
+
+def test_unknown_version_rejected() -> None:
+    with pytest.raises(ValueError, match="version"):
+        unpack_envelope(b"\x09" + b"\x00" * 64)

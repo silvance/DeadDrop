@@ -143,13 +143,13 @@ class DeadDropNode:
         if stats["bytes"] + len(ciphertext) > self.config.max_total_bytes:
             return err(ERR_FULL, "node storage is full")
 
-        sender_hint = remote_identity.hash if remote_identity is not None else None
+        # The sender's identity is deliberately not recorded. Clients do not
+        # identify on put links, so remote_identity is normally None here.
         try:
             record = self.store.put(
                 recipient_hash=bytes(recipient),
                 ciphertext=bytes(ciphertext),
                 ttl_seconds=ttl,
-                sender_hint=sender_hint,
             )
         except Exception as exc:
             log.exception("put failed: %s", exc)

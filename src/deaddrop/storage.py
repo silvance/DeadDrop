@@ -17,8 +17,7 @@ CREATE TABLE IF NOT EXISTS drops (
     ciphertext      BLOB    NOT NULL,
     size            INTEGER NOT NULL,
     created_at      INTEGER NOT NULL,
-    expires_at      INTEGER NOT NULL,
-    sender_hint     BLOB
+    expires_at      INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_drops_recipient
     ON drops(recipient_hash, id);
@@ -35,7 +34,6 @@ class DropRecord:
     size: int
     created_at: int
     expires_at: int
-    sender_hint: bytes | None
 
 
 @dataclass(frozen=True)
@@ -56,7 +54,51 @@ class DropStore:
     def __init__(self, db_path: Path | str):
         self.db_path = str(db_path)
         with self._connect() as conn:
+            self._drop_sender_hint(conn)
             conn.executescript(SCHEMA)
+
+    @staticmethod
+    def _drop_sender_hint(conn: sqlite3.Connection) -> None:
+        """Remove the sender_hint column written by deaddrop 0.1.0.
+
+        It recorded the sender's identity hash next to every drop, which
+        exposes the sender/recipient graph to anyone who seizes the
+        database. The table is rebuilt and the file vacuumed so the old
+        values do not linger in free pages.
+        """
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(drops)")}
+        if "sender_hint" not in columns:
+            return
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            conn.execute(
+                """
+                CREATE TABLE drops_new (
+                    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                    recipient_hash  BLOB    NOT NULL,
+                    ciphertext      BLOB    NOT NULL,
+                    size            INTEGER NOT NULL,
+                    created_at      INTEGER NOT NULL,
+                    expires_at      INTEGER NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO drops_new
+                    (id, recipient_hash, ciphertext, size, created_at, expires_at)
+                SELECT id, recipient_hash, ciphertext, size, created_at, expires_at
+                FROM drops
+                """
+            )
+            conn.execute("DROP TABLE drops")
+            conn.execute("ALTER TABLE drops_new RENAME TO drops")
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+        conn.execute("VACUUM")
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
@@ -64,6 +106,9 @@ class DropStore:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
         conn.execute("PRAGMA foreign_keys=ON")
+        # Overwrite deleted rows (fetched or expired drops) with zeros so a
+        # seized database file does not retain their recipient hashes.
+        conn.execute("PRAGMA secure_delete=ON")
         try:
             yield conn
         finally:
@@ -76,7 +121,6 @@ class DropStore:
         recipient_hash: bytes,
         ciphertext: bytes,
         ttl_seconds: int,
-        sender_hint: bytes | None = None,
         now: int | None = None,
     ) -> DropRecord:
         if ttl_seconds <= 0:
@@ -88,10 +132,10 @@ class DropStore:
             cur = conn.execute(
                 """
                 INSERT INTO drops
-                    (recipient_hash, ciphertext, size, created_at, expires_at, sender_hint)
-                VALUES (?, ?, ?, ?, ?, ?)
+                    (recipient_hash, ciphertext, size, created_at, expires_at)
+                VALUES (?, ?, ?, ?, ?)
                 """,
-                (recipient_hash, ciphertext, size, now, expires, sender_hint),
+                (recipient_hash, ciphertext, size, now, expires),
             )
             drop_id = cur.lastrowid
         return DropRecord(
@@ -101,7 +145,6 @@ class DropStore:
             size=size,
             created_at=now,
             expires_at=expires,
-            sender_hint=sender_hint,
         )
 
     def delete(self, drop_id: int, recipient_hash: bytes) -> bool:
@@ -144,7 +187,7 @@ class DropStore:
         with self._connect() as conn:
             row = conn.execute(
                 """
-                SELECT id, recipient_hash, ciphertext, size, created_at, expires_at, sender_hint
+                SELECT id, recipient_hash, ciphertext, size, created_at, expires_at
                 FROM drops
                 WHERE id = ? AND recipient_hash = ? AND expires_at > ?
                 """,

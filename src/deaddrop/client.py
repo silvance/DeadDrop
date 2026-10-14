@@ -145,7 +145,7 @@ class DeadDropClient:
     # ---- core RPC -------------------------------------------------------
 
     def info(self, node_hash: bytes) -> dict:
-        with self._open(node_hash) as session:
+        with self._open(node_hash, identify=False) as session:
             return session.request(PATH_INFO)
 
     def put(
@@ -155,7 +155,8 @@ class DeadDropClient:
         ciphertext: bytes,
         ttl_seconds: int,
     ) -> dict:
-        with self._open(node_hash) as session:
+        # Put links stay anonymous: the node never learns who dropped what.
+        with self._open(node_hash, identify=False) as session:
             return session.request(
                 PATH_PUT,
                 {
@@ -166,12 +167,12 @@ class DeadDropClient:
             )
 
     def list_drops(self, node_hash: bytes) -> list[dict]:
-        with self._open(node_hash) as session:
+        with self._open(node_hash, identify=True) as session:
             resp = session.request(PATH_LIST)
         return resp.get("drops", [])
 
     def fetch_drop(self, node_hash: bytes, drop_id: int) -> bytes:
-        with self._open(node_hash) as session:
+        with self._open(node_hash, identify=True) as session:
             resp = session.request(PATH_FETCH, {"drop_id": drop_id})
         return bytes(resp["ciphertext"])
 
@@ -213,11 +214,11 @@ class DeadDropClient:
 
     # ---- link plumbing --------------------------------------------------
 
-    def _open(self, node_hash: bytes) -> "_LinkContext":
+    def _open(self, node_hash: bytes, *, identify: bool) -> "_LinkContext":
         self.start()
-        return _LinkContext(self, node_hash)
+        return _LinkContext(self, node_hash, identify)
 
-    def _establish_link(self, node_hash: bytes) -> RNS.Link:
+    def _establish_link(self, node_hash: bytes, identify: bool) -> RNS.Link:
         if len(node_hash) != 16:
             raise ValueError("node_hash must be 16 bytes")
         if not RNS.Transport.has_path(node_hash):
@@ -242,7 +243,6 @@ class DeadDropClient:
             NODE_ASPECT,
         )
         link = RNS.Link(destination)
-        link.identify(self.identity)
 
         established = threading.Event()
         closed = threading.Event()
@@ -265,6 +265,9 @@ class DeadDropClient:
             raise RequestTimeout("link establishment timed out")
         if link.status != RNS.Link.ACTIVE:
             raise DeadDropError("link did not reach ACTIVE state")
+        if identify:
+            # Only valid on an ACTIVE link; RNS silently ignores it earlier.
+            link.identify(self.identity)
         return link
 
     @staticmethod
@@ -284,13 +287,14 @@ class DeadDropClient:
 class _LinkContext:
     """Context manager that owns a Link for the duration of a request batch."""
 
-    def __init__(self, client: DeadDropClient, node_hash: bytes):
+    def __init__(self, client: DeadDropClient, node_hash: bytes, identify: bool):
         self._client = client
         self._node_hash = node_hash
+        self._identify = identify
         self._session: _LinkSession | None = None
 
     def __enter__(self) -> _LinkSession:
-        link = self._client._establish_link(self._node_hash)
+        link = self._client._establish_link(self._node_hash, self._identify)
         self._session = _LinkSession(link, self._client.config.request_timeout)
         return self._session
 

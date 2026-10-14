@@ -13,6 +13,7 @@ import RNS
 from . import __version__
 from .client import DeadDropClient, DeadDropError, PathNotFoundError
 from .config import ClientConfig, NodeConfig
+from .crypto import PayloadTooLarge, max_body_bytes
 from .node import DeadDropNode
 
 
@@ -39,6 +40,18 @@ def _configure_logging(verbosity: int) -> None:
     )
 
 
+def _common_options() -> argparse.ArgumentParser:
+    """Options accepted after the subcommand too (e.g. ``deaddrop-node run -v``).
+
+    Defaults are suppressed so they don't overwrite values given before the
+    subcommand.
+    """
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--data-dir", type=Path, default=argparse.SUPPRESS)
+    common.add_argument("-v", "--verbose", action="count", default=argparse.SUPPRESS)
+    return common
+
+
 # =====================================================================
 # deaddrop-node entry point
 # =====================================================================
@@ -50,11 +63,12 @@ def _build_node_parser() -> argparse.ArgumentParser:
     parser.add_argument("-v", "--verbose", action="count", default=0)
     parser.add_argument("--version", action="version", version=f"deaddrop-node {__version__}")
     sub = parser.add_subparsers(dest="cmd")
+    common = _common_options()
 
-    p_run = sub.add_parser("run", help="Run the node (default)")
+    p_run = sub.add_parser("run", parents=[common], help="Run the node (default)")
     p_run.set_defaults(func=_cmd_node_run)
 
-    p_info = sub.add_parser("info", help="Print this node's destination hash")
+    p_info = sub.add_parser("info", parents=[common], help="Print this node's destination hash")
     p_info.set_defaults(func=_cmd_node_info)
 
     parser.set_defaults(func=_cmd_node_run)
@@ -99,19 +113,20 @@ def _build_client_parser() -> argparse.ArgumentParser:
     parser.add_argument("-v", "--verbose", action="count", default=0)
     parser.add_argument("--version", action="version", version=f"deaddrop {__version__}")
     sub = parser.add_subparsers(dest="cmd", required=True)
+    common = _common_options()
 
-    p_whoami = sub.add_parser("whoami", help="Print this client's identity hash")
+    p_whoami = sub.add_parser("whoami", parents=[common], help="Print this client's identity hash")
     p_whoami.set_defaults(func=_cmd_whoami)
 
-    p_pub = sub.add_parser("pubkey", help="Export this client's public key for out-of-band sharing")
+    p_pub = sub.add_parser("pubkey", parents=[common], help="Export this client's public key for out-of-band sharing")
     p_pub.add_argument("path", type=Path)
     p_pub.set_defaults(func=_cmd_pubkey)
 
-    p_info = sub.add_parser("info", help="Query a dead-drop node for its info")
+    p_info = sub.add_parser("info", parents=[common], help="Query a dead-drop node for its info")
     p_info.add_argument("--node", type=_parse_hash, required=True)
     p_info.set_defaults(func=_cmd_info)
 
-    p_send = sub.add_parser("send", help="Send a text message via a dead-drop node")
+    p_send = sub.add_parser("send", parents=[common], help="Send a text message via a dead-drop node")
     p_send.add_argument("--node", type=_parse_hash, required=True)
     g = p_send.add_mutually_exclusive_group(required=True)
     g.add_argument("--to", type=_parse_hash, help="Recipient identity hash (must be in announce cache)")
@@ -121,7 +136,7 @@ def _build_client_parser() -> argparse.ArgumentParser:
     p_send.add_argument("--mime", default="text/plain; charset=utf-8")
     p_send.set_defaults(func=_cmd_send)
 
-    p_send_file = sub.add_parser("send-file", help="Send a file via a dead-drop node")
+    p_send_file = sub.add_parser("send-file", parents=[common], help="Send a file via a dead-drop node")
     p_send_file.add_argument("--node", type=_parse_hash, required=True)
     g2 = p_send_file.add_mutually_exclusive_group(required=True)
     g2.add_argument("--to", type=_parse_hash)
@@ -131,11 +146,11 @@ def _build_client_parser() -> argparse.ArgumentParser:
     p_send_file.add_argument("--mime", default="application/octet-stream")
     p_send_file.set_defaults(func=_cmd_send_file)
 
-    p_list = sub.add_parser("list", help="List drops addressed to this client at a node")
+    p_list = sub.add_parser("list", parents=[common], help="List drops addressed to this client at a node")
     p_list.add_argument("--node", type=_parse_hash, required=True)
     p_list.set_defaults(func=_cmd_list)
 
-    p_fetch = sub.add_parser("fetch", help="Fetch all drops addressed to this client (deletes them on the node)")
+    p_fetch = sub.add_parser("fetch", parents=[common], help="Fetch all drops addressed to this client (deletes them on the node)")
     p_fetch.add_argument("--node", type=_parse_hash, required=True)
     p_fetch.add_argument("--out-dir", type=Path, default=None, help="If set, write each drop's body to this directory")
     p_fetch.set_defaults(func=_cmd_fetch)
@@ -208,6 +223,12 @@ def _cmd_send(args) -> int:
             mime=args.mime,
             ttl_seconds=args.ttl,
         )
+    except PayloadTooLarge:
+        print(
+            f"error: message too large (max {max_body_bytes(args.mime)} bytes)",
+            file=sys.stderr,
+        )
+        return 1
     except (DeadDropError, PathNotFoundError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
@@ -229,6 +250,12 @@ def _cmd_send_file(args) -> int:
             mime=args.mime,
             ttl_seconds=args.ttl,
         )
+    except PayloadTooLarge:
+        print(
+            f"error: message too large (max {max_body_bytes(args.mime)} bytes)",
+            file=sys.stderr,
+        )
+        return 1
     except (DeadDropError, PathNotFoundError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
@@ -270,10 +297,15 @@ def _cmd_fetch(args) -> int:
     if args.out_dir:
         args.out_dir.mkdir(parents=True, exist_ok=True)
     for i, env in enumerate(envelopes, start=1):
+        # The sender hash is whatever the sender chose to write; it is not
+        # authenticated, so present it as a claim.
         sender = (
-            RNS.prettyhexrep(env.sender_hash) if env.sender_hash else "<anonymous>"
+            RNS.prettyhexrep(env.sender_hash) if env.sender_hash else "<none>"
         )
-        print(f"--- drop {i} from {sender} ({env.mime}, {len(env.body)} bytes) ---")
+        print(
+            f"--- drop {i}, claimed sender {sender} "
+            f"({env.mime}, {len(env.body)} bytes) ---"
+        )
         if args.out_dir:
             target = args.out_dir / f"drop-{i:04d}.bin"
             target.write_bytes(env.body)

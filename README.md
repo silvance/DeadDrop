@@ -22,10 +22,12 @@ receivers wander past, leaving and picking up envelopes.
 ```
    sender                  dead-drop node                 recipient
    ──────                  ──────────────                 ─────────
-1. encrypt body to
+1. pad body to a size
+   bucket, encrypt to
    recipient's RNS
    identity public key
-2. Link → node, "put" ──► store ciphertext in
+2. anonymous Link →
+   node, "put" ────────► store ciphertext in
                             SQLite, keyed by
                             recipient_hash
                                                 ◄── 3. Link → node, "list"
@@ -45,6 +47,9 @@ The node holds **opaque ciphertext**. It has no decryption key. The
 authorization check is fundamental: a request handler is invoked with the
 Link's authenticated `remote_identity`, and `list` / `fetch` only return
 drops where `recipient_hash == remote_identity.hash`.
+
+Senders never identify themselves to the node: `put` runs over an
+anonymous Link, and the node stores nothing about who made a drop.
 
 ## Install
 
@@ -88,7 +93,7 @@ It will print its **destination hash** — copy it; senders and receivers
 need it. Example:
 
 ```
-deaddrop-node 0.1.0 up, destination <1c4b…7e9a>
+deaddrop-node 0.2.0 up, destination <1c4b…7e9a>
 ```
 
 ### 3. Bob (recipient) publishes his identity
@@ -134,9 +139,12 @@ Edit your Reticulum config and replace the `TCP*Interface` block with
 `RNodeInterface` (see `deploy/reticulum.conf.example`). No DeadDrop code
 changes are needed — the transport is entirely Reticulum's concern.
 
-You'll want to tune `max_drop_bytes` in `NodeConfig` for your link budget;
-the default 64 KiB is fine on TCP but tiny LoRa payloads will need many
-hops per drop. Reticulum handles fragmentation automatically.
+Every drop is padded to one of five ciphertext sizes: 256 B, 1 KiB,
+4 KiB, 16 KiB or 64 KiB. A short text message costs 256 bytes on air. The
+largest body you can send is a little under 64 KiB (`deaddrop send` tells
+you the exact limit if you go over). On LoRa, keep messages in the small
+buckets; Reticulum handles fragmentation automatically, but a 64 KiB drop
+takes a long time at LoRa data rates.
 
 ## Production deployment
 
@@ -184,7 +192,7 @@ is msgpack-encoded (using `RNS.vendor.umsgpack`, so no extra dep).
 | path    | request                                                                  | response                                                           | auth?             |
 |---------|--------------------------------------------------------------------------|--------------------------------------------------------------------|-------------------|
 | `info`  | `{}`                                                                     | `{status, version, drops, bytes, max_drop_bytes, max_ttl_seconds}` | not required      |
-| `put`   | `{recipient_hash: bytes(16), ciphertext: bytes, ttl_seconds: int}`       | `{status, drop_id, expires_at}`                                    | Link identity used as `sender_hint` |
+| `put`   | `{recipient_hash: bytes(16), ciphertext: bytes, ttl_seconds: int}`       | `{status, drop_id, expires_at}`                                    | none — client does not identify, node records no sender |
 | `list`  | `{}`                                                                     | `{status, drops: [{id, size, created_at, expires_at}]}`            | **must match recipient** |
 | `fetch` | `{drop_id: int}`                                                         | `{status, drop_id, ciphertext, created_at, expires_at}`            | **must match recipient** |
 
@@ -194,38 +202,71 @@ The envelope inside `ciphertext` (after asymmetric decryption with the
 recipient's RNS identity) is:
 
 ```
-+--------+--------+------------------+------------------+---------+--------+------+
-| ver(1) | flags  | recipient_hash   | sender_hash      | mime_len| mime   | body |
-| u8     | u8     | 16 bytes         | 16 bytes (or 0)  | u16 BE  | utf-8  | ...  |
-+--------+--------+------------------+------------------+---------+--------+------+
++--------+--------+----------------+-----------------+----------+----------+-------+------+---------+
+| ver(2) | flags  | recipient_hash | sender_hash     | mime_len | body_len | mime  | body | padding |
+| u8     | u8     | 16 bytes       | 16 bytes (or 0) | u16 BE   | u32 BE   | utf-8 | ...  | zeros   |
++--------+--------+----------------+-----------------+----------+----------+-------+------+---------+
 ```
 
-`flags & 1` indicates the sender hash is present.
+`flags & 1` indicates the sender hash is present. The zero padding brings
+the plaintext to `bucket − 96` bytes, so after encryption the ciphertext is
+exactly 256, 1024, 4096, 16384 or 65536 bytes (96 bytes is what
+`Identity.encrypt` adds: ephemeral key, IV, one padding block and HMAC).
+
+Version 1 envelopes (deaddrop 0.1.0: same header without `body_len`, no
+padding) are still accepted when decrypting.
 
 ## Threat model
 
 **The node is not trusted with message contents.** Drops are encrypted
-to the recipient's X25519 public key by Reticulum's `Identity.encrypt`,
-which uses ephemeral keys per message (forward secrecy). A compromised
-node can:
+to the recipient's long-term X25519 public key by Reticulum's
+`Identity.encrypt`: a fresh ephemeral X25519 key per message, HKDF, then
+AES-CBC + HMAC-SHA256 (AES-256 in current Reticulum releases).
+
+**Stored drops have no forward secrecy.** The ephemeral key only protects
+the sender's side. Anyone who copies drops off a node and *later* obtains
+the recipient's identity private key can decrypt all of them. Forward
+secrecy applies only to Reticulum Link traffic in transit. Keep recipient
+identity files safe, fetch promptly, and use short TTLs.
+
+Someone who seizes or controls a node can:
 
 - Drop, delay, or duplicate messages.
-- See which recipient hashes have traffic, when, and how much.
-- Learn the sender's identity hash (it appears in the Link).
+- See which recipient hashes have drops waiting, when they were made and
+  when they expire.
+- See each drop's size bucket (256 B … 64 KiB), but not its real length.
+- See which recipient fetched when, since `list`/`fetch` require the
+  recipient to identify.
+- Forge drops, if they have the recipient's public key (it is handed out
+  so people can send, and any Reticulum announce by the recipient
+  reveals it). Anyone holding it can encrypt a message to the recipient
+  and write any `sender_hash` into it, which is why the client shows a
+  *claimed* sender.
 
-A compromised node **cannot**:
+They **cannot**:
 
-- Read message contents.
+- Read message contents without the recipient's private key.
 - Impersonate a recipient (the Link's identity proof is required to
   `list` or `fetch`).
-- Inject forged messages from a third party (the envelope's `sender_hash`
-  is inside the recipient-encrypted blob, but a compromised node may strip
-  or alter the sender hint — never trust it without an out-of-band channel
-  or in-message signature).
+- Learn who made a drop from the node's database or its requests: senders
+  never identify, and the store has no sender column. (Reticulum transport
+  details, such as which interface a packet arrived on, are still visible
+  to whoever runs the node.)
 
-If sender authenticity matters, sign your `body` before encrypting, or
-ride it on a Reticulum `Identity.sign` ed25519 signature your application
-verifies.
+On disk, the node turns on SQLite `secure_delete`, so fetched and expired
+drops are overwritten with zeros rather than left in free pages. Older
+copies of pages can still survive in the SQLite write-ahead log
+(`drops.sqlite-wal`) until it is checkpointed and reused, and flash
+storage can keep old blocks after an overwrite, so run the node on an
+encrypted filesystem if seizure is a concern.
+
+Upgrading from 0.1.0: the node removes the old `sender_hint` column on
+first start and vacuums the database so the stored sender hashes are
+erased, not just hidden.
+
+If sender authenticity matters, sign your `body` with the sender's
+Reticulum identity (`Identity.sign`, Ed25519) before encrypting, and have
+the recipient verify it.
 
 ## Development
 
@@ -234,10 +275,11 @@ pip install -e '.[dev]'
 pytest
 ```
 
-Tests cover the storage layer (no RNS needed) and the protocol handlers
-(needs `rns` installed, but no live network). End-to-end tests against a
-running Reticulum stack are deliberately out of scope here — run a TCP
-loopback as in the quick-start to validate.
+Tests cover the storage layer and schema migration (no RNS needed), the
+envelope and padding, the protocol handlers and CLI argument parsing
+(these need `rns` installed, but no live network). There is no automated
+end-to-end test against a running Reticulum stack yet; run a TCP loopback
+as in the quick start to validate.
 
 ## License
 

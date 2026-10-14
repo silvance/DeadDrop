@@ -80,3 +80,70 @@ def test_stats(store: DropStore) -> None:
 def test_ttl_must_be_positive(store: DropStore) -> None:
     with pytest.raises(ValueError):
         store.put(HASH_A, b"x", ttl_seconds=0)
+
+
+def _create_v010_db(path: Path, hint: bytes) -> None:
+    """Create a database the way deaddrop 0.1.0 did, with sender_hint."""
+    import sqlite3
+
+    conn = sqlite3.connect(path, isolation_level=None)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.executescript(
+        """
+        CREATE TABLE drops (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            recipient_hash  BLOB    NOT NULL,
+            ciphertext      BLOB    NOT NULL,
+            size            INTEGER NOT NULL,
+            created_at      INTEGER NOT NULL,
+            expires_at      INTEGER NOT NULL,
+            sender_hint     BLOB
+        );
+        CREATE INDEX idx_drops_recipient ON drops(recipient_hash, id);
+        CREATE INDEX idx_drops_expiry ON drops(expires_at);
+        """
+    )
+    now = int(time.time())
+    for i in range(1, 4):
+        conn.execute(
+            "INSERT INTO drops (recipient_hash, ciphertext, size, created_at, expires_at, sender_hint)"
+            " VALUES (?, ?, ?, ?, ?, ?)",
+            (HASH_A, b"c" * i, i, now, now + 3600, hint),
+        )
+    conn.close()
+
+
+def test_migration_drops_sender_hint_and_keeps_drops(tmp_path: Path) -> None:
+    import sqlite3
+
+    db = tmp_path / "old.sqlite"
+    hint = b"\xde\xad\xbe\xef" * 4
+    _create_v010_db(db, hint)
+
+    store = DropStore(db)
+
+    conn = sqlite3.connect(db)
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(drops)")}
+    indexes = {row[1] for row in conn.execute("PRAGMA index_list(drops)")}
+    conn.close()
+    assert "sender_hint" not in columns
+    assert {"idx_drops_recipient", "idx_drops_expiry"} <= indexes
+
+    drops = store.list_for(HASH_A)
+    assert [d.size for d in drops] == [1, 2, 3]
+    assert store.fetch(drops[0].id, HASH_A).ciphertext == b"c"
+
+    # New ids continue after the migrated ones.
+    assert store.put(HASH_A, b"new", ttl_seconds=60).id > drops[-1].id
+
+    # The old sender hashes must not survive anywhere in the files on disk.
+    for f in tmp_path.iterdir():
+        assert hint not in f.read_bytes(), f"sender hint left in {f.name}"
+
+
+def test_migration_is_noop_on_current_schema(tmp_path: Path) -> None:
+    db = tmp_path / "drops.sqlite"
+    store = DropStore(db)
+    record = store.put(HASH_A, b"x", ttl_seconds=60)
+    reopened = DropStore(db)
+    assert reopened.fetch(record.id, HASH_A) is not None
